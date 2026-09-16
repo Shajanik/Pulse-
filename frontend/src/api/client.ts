@@ -1,6 +1,7 @@
 import type { JoinResponse, PollSummary, PublicPoll, ResultsPayload } from "../types";
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8080/api";
+const RAW_API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8080/api";
+const API_BASE = RAW_API_BASE.replace(/\/$/, ""); // strip trailing slash if present
 
 export class ApiError extends Error {
   status: number;
