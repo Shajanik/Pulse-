@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
+import { api } from "../api/client";
 import type { ResultsPayload } from "../types";
 
 const RAW_WS_BASE: string =
@@ -18,9 +19,22 @@ if (window.location.protocol === "https:" && WS_BASE.startsWith("ws://")) {
   WS_BASE = "wss://" + WS_BASE.slice("ws://".length);
 }
 
+const MAX_BACKOFF_MS = 15_000;
+
+/** Keep whichever snapshot has more votes, so a slow REST response can
+ *  never overwrite newer data that already arrived over the WebSocket. */
+function newer(
+  prev: ResultsPayload | undefined,
+  next: ResultsPayload
+): ResultsPayload {
+  return !prev || next.totalVotes >= prev.totalVotes ? next : prev;
+}
+
 /**
- * Subscribes to a poll's room over WebSocket and keeps results
- * in sync with every broadcast the server sends.
+ * Subscribes to a poll's room over WebSocket and keeps results in sync with
+ * every broadcast the server sends. If the socket drops it reconnects with
+ * backoff, and it re-fetches results on every (re)connect and whenever the
+ * tab becomes visible again, so missed votes are never left stale.
  */
 export function useRoomResults(
   code: string | undefined,
@@ -28,12 +42,11 @@ export function useRoomResults(
 ) {
   const [results, setResults] = useState<ResultsPayload | undefined>(initial);
   const [connected, setConnected] = useState(false);
-  const socketRef = useRef<WebSocket | null>(null);
 
   // Sync results whenever the initial REST fetch resolves or changes.
   useEffect(() => {
     if (initial) {
-      setResults(initial);
+      setResults((prev) => newer(prev, initial));
     }
   }, [initial]);
 
@@ -43,42 +56,79 @@ export function useRoomResults(
       return;
     }
 
-    const socket = new WebSocket(`${WS_BASE}/ws/room/${code}`);
-    socketRef.current = socket;
+    let socket: WebSocket | null = null;
+    let timer: number | undefined;
+    let retry = 0;
+    let disposed = false;
 
-    socket.onopen = () => {
-      setConnected(true);
+    // Pull the latest standings over REST (covers votes missed before the
+    // socket opened, or while it was down).
+    const resync = () => {
+      api
+        .getResults(code)
+        .then((r) => {
+          if (!disposed) setResults((prev) => newer(prev, r));
+        })
+        .catch(() => {
+          // Ignore; the next broadcast or resync will catch up.
+        });
     };
 
-    socket.onclose = () => {
-      setConnected(false);
-      if (socketRef.current === socket) {
-        socketRef.current = null;
-      }
-    };
+    const connect = () => {
+      const ws = new WebSocket(`${WS_BASE}/ws/room/${code}`);
+      socket = ws;
 
-    socket.onerror = () => {
-      setConnected(false);
-    };
+      ws.onopen = () => {
+        retry = 0;
+        setConnected(true);
+        resync();
+      };
 
-    socket.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data) as ResultsPayload;
-
-        if (payload.type === "results") {
-          setResults(payload);
+      ws.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data) as ResultsPayload;
+          if (payload.type === "results") {
+            setResults(payload);
+          }
+        } catch {
+          // Ignore malformed WebSocket messages.
         }
-      } catch {
-        // Ignore malformed WebSocket messages.
+      };
+
+      ws.onerror = () => {
+        // onclose always follows; it handles the reconnect.
+        ws.close();
+      };
+
+      ws.onclose = () => {
+        setConnected(false);
+        if (disposed || socket !== ws) return;
+        const delay = Math.min(1000 * 2 ** retry, MAX_BACKOFF_MS);
+        retry += 1;
+        timer = window.setTimeout(connect, delay);
+      };
+    };
+
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      resync();
+      // Browsers can silently kill sockets in background tabs.
+      if (!socket || socket.readyState === WebSocket.CLOSED) {
+        window.clearTimeout(timer);
+        retry = 0;
+        connect();
       }
     };
+
+    connect();
+    document.addEventListener("visibilitychange", onVisible);
 
     return () => {
-      socket.close();
-
-      if (socketRef.current === socket) {
-        socketRef.current = null;
-      }
+      disposed = true;
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      socket?.close();
+      socket = null;
     };
   }, [code]);
 
